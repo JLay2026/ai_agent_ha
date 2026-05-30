@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import pathlib
 import time
 
 import voluptuous as vol
@@ -16,6 +15,7 @@ from homeassistant.core import HomeAssistant, SupportsResponse
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
+from homeassistant.loader import async_get_integration
 
 from .agent import AiAgentHaAgent
 from .const import AI_PROVIDERS, DOMAIN
@@ -203,18 +203,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             raise ConfigEntryNotReady("Config entry missing required 'ai_provider' key")
 
         if DOMAIN not in hass.data:
-            # Read version from manifest for cache-busting the panel JS URL
-            _manifest_ver = "0"
+            # Read version via HA's integration loader — fully async, no
+            # event-loop blocking. Replaces a prior importlib.metadata.version()
+            # + pathlib.Path(...).read_text() pair that triggered three
+            # WARNING/blocking-I/O detections per boot:
+            #   - listdir on /config/deps/lib/python3.x/site-packages/
+            #     (from importlib.metadata.version)
+            #   - read_text + open on manifest.json (from the pathlib fallback)
+            # `async_get_integration` reads from HA's already-cached integration
+            # manifest registry — no syscalls at call time.
             try:
-                import importlib.metadata
-                _manifest_ver = importlib.metadata.version("ai_agent_ha") or "0"
-            except Exception:
-                try:
-                    _mf_path = pathlib.Path(__file__).parent / "manifest.json"
-                    _mf = json.loads(_mf_path.read_text())
-                    _manifest_ver = _mf.get("version", "0")
-                except Exception:
-                    pass
+                _integration = await async_get_integration(hass, DOMAIN)
+                _manifest_ver = (
+                    str(_integration.version) if _integration.version else "0"
+                )
+            except Exception:  # pragma: no cover - defensive
+                _LOGGER.warning(
+                    "Could not resolve %s manifest version via "
+                    "async_get_integration; falling back to '0' for panel "
+                    "cache-bust URL.",
+                    DOMAIN,
+                )
+                _manifest_ver = "0"
             hass.data[DOMAIN] = {"agents": {}, "configs": {}, "manifest_version": _manifest_ver}
 
         provider = config_data["ai_provider"]
@@ -315,7 +325,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             auto = result.get("automation", {})
             alias = auto.get("alias", "New Automation")
             return (
-                f"I've created the \u201c{alias}\u201d automation. "
+                f"I've created the “{alias}” automation. "
                 "Would you like me to activate it?"
             )
         # text — pass through as-is
